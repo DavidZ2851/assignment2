@@ -14,6 +14,10 @@ import matplotlib.pyplot as plt
 from pytorch3d.transforms import Rotate, axis_angle_to_matrix
 import math
 import numpy as np
+import os
+import imageio
+import utils_viz
+from PIL import Image
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Singleto3D', add_help=False)
@@ -28,6 +32,9 @@ def get_args_parser():
     parser.add_argument('--load_checkpoint', action='store_true')  
     parser.add_argument('--device', default='cuda', type=str) 
     parser.add_argument('--load_feat', action='store_true') 
+    parser.add_argument('--image_size', default=256, type=int)
+    parser.add_argument('--num_views', default=36, type=int)
+    parser.add_argument('--vis_dir', default='vis', type=str)
     return parser
 
 def preprocess(feed_dict, args):
@@ -85,9 +92,75 @@ def compute_sampling_metrics(pred_points, gt_points, thresholds, eps=1e-8):
     metrics = {k: v.cpu() for k, v in metrics.items()}
     return metrics
 
+def vox_to_mesh(voxels):
+    """
+    Marching-cubes a predicted grid and move it into the gt mesh's frame.
+
+    Same chain evaluate() applies to its sampled points: index space -> Mem2Ref,
+    rotate pi about y, recenter. Returns (verts, faces) or None when the grid has
+    no surface at the 0.5 level.
+    """
+    H, W, D = voxels.shape[2:]
+    grid = torch.sigmoid(voxels).detach().cpu().squeeze().numpy()
+    verts, faces = mcubes.marching_cubes(grid, isovalue=0.5)
+    if len(verts) == 0 or len(faces) == 0:
+        return None
+
+    verts = torch.tensor(verts).float().unsqueeze(0)
+    verts = utils_vox.Mem2Ref(verts, H, W, D)
+    Rot = axis_angle_to_matrix(torch.as_tensor(np.array([[0.0, -math.pi, 0.0]])).float())
+    verts = Rotate(Rot).transform_points(verts)
+    verts = verts - verts.mean(1, keepdim=True)
+    return verts[0], torch.tensor(faces.astype(int))
+
+
+def render_strip(verts, faces, color, scale, args):
+    """Centers, rescales and orbits one mesh; blank frames if it has no surface."""
+    if verts is None:
+        return utils_viz.blank_frames(args.image_size, args.num_views)
+    verts = (verts - verts.mean(dim=0, keepdim=True)) / scale
+    textures = pytorch3d.renderer.TexturesVertex(
+        torch.tensor(color).expand(verts.shape).unsqueeze(0)
+    )
+    mesh = pytorch3d.structures.Meshes(
+        [verts], [faces], textures=textures.to(args.device)
+    ).to(args.device)
+    return utils_viz.render_360(
+        mesh, image_size=args.image_size, num_views=args.num_views,
+        dist=3.0, device=args.device,
+    )
+
+
+def visualize_prediction(images_gt, predictions, mesh_gt, step, args):
+    """Writes an [input RGB | prediction | ground truth mesh] gif and still."""
+    os.makedirs(args.vis_dir, exist_ok=True)
+
+    gt_verts = mesh_gt.verts_list()[0].detach().cpu()
+    gt_faces = mesh_gt.faces_list()[0].detach().cpu()
+    scale = (gt_verts - gt_verts.mean(0, keepdim=True)).norm(dim=1).max()
+
+    rgb = (images_gt[0].detach().cpu().numpy().clip(0, 1) * 255).astype(np.uint8)
+    rgb = np.array(Image.fromarray(rgb).resize((args.image_size, args.image_size)))
+    rgb_frames = [rgb] * args.num_views
+
+    pred = vox_to_mesh(predictions) if args.type == "vox" else None
+    pred_frames = render_strip(
+        *(pred if pred is not None else (None, None)),
+        color=(0.85, 0.45, 0.35), scale=scale, args=args,
+    )
+    gt_frames = render_strip(
+        gt_verts, gt_faces, color=(0.45, 0.55, 0.85), scale=scale, args=args,
+    )
+
+    strip = [np.concatenate(f, axis=1) for f in zip(rgb_frames, pred_frames, gt_frames)]
+    imageio.mimsave(f'{args.vis_dir}/{step}_{args.type}.gif', strip, duration=1000 // 15, loop=0)
+    plt.imsave(f'{args.vis_dir}/{step}_{args.type}.png', strip[0])
+    print(f'wrote {args.vis_dir}/{step}_{args.type}.gif')
+
+
 def evaluate(predictions, mesh_gt, thresholds, args):
     if args.type == "vox":
-        voxels_src = predictions
+        voxels_src = torch.sigmoid(predictions)
         H,W,D = voxels_src.shape[2:]
         vertices_src, faces_src = mcubes.marching_cubes(voxels_src.detach().cpu().squeeze().numpy(), isovalue=0.5)
         vertices_src = torch.tensor(vertices_src).float()
@@ -164,12 +237,9 @@ def evaluate_model(args):
 
         metrics = evaluate(predictions, mesh_gt, thresholds, args)
 
-        # TODO:
-        # if (step % args.vis_freq) == 0:
-        #     # visualization block
-        #     #  rend = 
-        #     plt.imsave(f'vis/{step}_{args.type}.png', rend)
-      
+        if (step % args.vis_freq) == 0:
+            visualize_prediction(images_gt, predictions, mesh_gt, step, args)
+
 
         total_time = time.time() - start_time
         iter_time = time.time() - iter_start_time

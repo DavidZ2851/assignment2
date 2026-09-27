@@ -9,6 +9,7 @@ from pytorch3d.ops import sample_points_from_meshes
 from pytorch3d.structures import Meshes
 import dataset_location
 import torch
+import utils_viz
 
 
 
@@ -24,7 +25,99 @@ def get_args_parser():
     parser.add_argument('--w_chamfer', default=1.0, type=float)
     parser.add_argument('--w_smooth', default=0.1, type=float)
     parser.add_argument('--device', default='cuda', type=str) 
+    parser.add_argument('--output_dir', default='data', type=str)
+    parser.add_argument('--image_size', default=256, type=int)
+    parser.add_argument('--num_views', default=36, type=int)
     return parser
+
+def visualize_voxels(voxels_src, voxels_tgt, args):
+    """
+    Renders the optimized voxel grid beside the ground truth as one gif.
+
+    Left half is the fit, right half is the target, both orbited by the same
+    camera so the two are directly comparable frame for frame.
+    """
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # voxels_src are logits, so squash them before thresholding -- that way the
+    # 0.5 iso-level means "occupied" for the fit and the target alike.
+    meshes = {
+        "optimized": utils_viz.voxels_to_mesh(
+            torch.sigmoid(voxels_src), color=(0.85, 0.45, 0.35), device=args.device
+        ),
+        "ground truth": utils_viz.voxels_to_mesh(
+            voxels_tgt, color=(0.45, 0.55, 0.85), device=args.device
+        ),
+    }
+
+    frames = {}
+    for name, mesh in meshes.items():
+        if mesh is None:
+            print(f"warning: {name} voxel grid has no surface at the 0.5 level set")
+            frames[name] = utils_viz.blank_frames(args.image_size, args.num_views)
+        else:
+            frames[name] = utils_viz.render_360(
+                mesh, image_size=args.image_size, num_views=args.num_views,
+                dist=3.0, device=args.device,
+            )
+
+    utils_viz.save_side_by_side_gif(
+        frames["optimized"], frames["ground truth"],
+        os.path.join(args.output_dir, "q1.1_voxel_fit.gif"),
+    )
+
+
+def visualize_pointclouds(pointclouds_src, pointclouds_tgt, args):
+    """
+    Renders the optimized point cloud beside the ground truth as one gif.
+
+    Both clouds are normalized by the SAME transform, derived from the target,
+    so the view is framed sensibly without hiding any residual offset or scale
+    error in the fit.
+    """
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    center, scale = utils_viz.unit_sphere_transform(pointclouds_tgt)
+    normalize = lambda p: (p.detach() - center) / scale
+
+    frames_src = utils_viz.render_points_360(
+        normalize(pointclouds_src), color=(0.85, 0.45, 0.35),
+        image_size=args.image_size, num_views=args.num_views, device=args.device,
+    )
+    frames_tgt = utils_viz.render_points_360(
+        normalize(pointclouds_tgt), color=(0.45, 0.55, 0.85),
+        image_size=args.image_size, num_views=args.num_views, device=args.device,
+    )
+    utils_viz.save_side_by_side_gif(
+        frames_src, frames_tgt,
+        os.path.join(args.output_dir, "q1.2_point_fit.gif"),
+    )
+
+
+def visualize_meshes(mesh_src, mesh_tgt, args):
+    """
+    Renders the optimized mesh beside the ground truth as one gif.
+
+    Both meshes share one normalization derived from the target, so the fit is
+    not silently re-centered or re-scaled onto it.
+    """
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    center, scale = utils_viz.unit_sphere_transform(mesh_tgt.verts_list()[0])
+    frames = []
+    for mesh, color in ((mesh_src, (0.85, 0.45, 0.35)), (mesh_tgt, (0.45, 0.55, 0.85))):
+        prepared = utils_viz.prepare_mesh(
+            mesh, color=color, center=center, scale=scale, device=args.device
+        )
+        frames.append(utils_viz.render_360(
+            prepared, image_size=args.image_size, num_views=args.num_views,
+            dist=3.0, device=args.device,
+        ))
+
+    utils_viz.save_side_by_side_gif(
+        frames[0], frames[1], os.path.join(args.output_dir, "q1.3_mesh_fit.gif"),
+    )
+
 
 def fit_mesh(mesh_src, mesh_tgt, args):
     start_iter = 0
@@ -130,6 +223,9 @@ def train_model(args):
         # fitting
         fit_voxel(voxels_src, voxels_tgt, args)
 
+        # visualization
+        visualize_voxels(voxels_src, voxels_tgt, args)
+
 
     elif args.type == "point":
         # initialization
@@ -139,6 +235,9 @@ def train_model(args):
 
         # fitting
         fit_pointcloud(pointclouds_src, pointclouds_tgt, args)        
+
+        # visualization
+        visualize_pointclouds(pointclouds_src, pointclouds_tgt, args)
     
     elif args.type == "mesh":
         # initialization
@@ -148,6 +247,9 @@ def train_model(args):
 
         # fitting
         fit_mesh(mesh_src, mesh_tgt, args)        
+
+        # visualization (fit_mesh deforms mesh_src in place)
+        visualize_meshes(mesh_src, mesh_tgt, args)
 
 
     
