@@ -12,7 +12,9 @@ import mcubes
 import utils_vox
 import matplotlib.pyplot as plt 
 from pytorch3d.transforms import Rotate, axis_angle_to_matrix
+import json
 import math
+import random
 import numpy as np
 import os
 import imageio
@@ -25,7 +27,16 @@ def get_args_parser():
     parser.add_argument('--vis_freq', default=1000, type=int)
     parser.add_argument('--batch_size', default=1, type=int)
     parser.add_argument('--num_workers', default=0, type=int)
-    parser.add_argument('--type', default='vox', choices=['vox', 'point', 'mesh'], type=str)
+    parser.add_argument('--type', default='vox', choices=['vox', 'point', 'mesh', 'implicit', 'parametric'], type=str)
+    parser.add_argument('--n_patches', default=4, type=int)
+    parser.add_argument('--dataset', default=None, choices=['chair', '3c'], type=str,
+                        help='overrides dataset_location.use_full_dataset')
+    parser.add_argument('--exp_name', default=None, type=str,
+                        help='loads checkpoint_<exp_name>.pth (default: <type>)')
+    parser.add_argument('--eval_class', default='all', choices=['all', 'chair', 'car', 'plane'], type=str,
+                        help='restrict the test split to one class')
+    parser.add_argument('--seed', default=0, type=int,
+                        help='fixes which view of each test model is drawn, so runs are comparable')
     parser.add_argument('--n_points', default=1000, type=int)
     parser.add_argument('--w_chamfer', default=1.0, type=float)
     parser.add_argument('--w_smooth', default=0.1, type=float)  
@@ -54,8 +65,8 @@ def save_plot(thresholds, avg_f1_score, args):
     ax.plot(thresholds, avg_f1_score, marker='o')
     ax.set_xlabel('Threshold')
     ax.set_ylabel('F1-score')
-    ax.set_title(f'Evaluation {args.type}')
-    plt.savefig(f'eval_{args.type}', bbox_inches='tight')
+    ax.set_title(f'Evaluation {args.exp_name}')
+    plt.savefig(f'eval_{args.exp_name}', bbox_inches='tight')
 
 
 def compute_sampling_metrics(pred_points, gt_points, thresholds, eps=1e-8):
@@ -143,26 +154,42 @@ def visualize_prediction(images_gt, predictions, mesh_gt, step, args):
     rgb = np.array(Image.fromarray(rgb).resize((args.image_size, args.image_size)))
     rgb_frames = [rgb] * args.num_views
 
-    pred = vox_to_mesh(predictions) if args.type == "vox" else None
-    pred_frames = render_strip(
-        *(pred if pred is not None else (None, None)),
-        color=(0.85, 0.45, 0.35), scale=scale, args=args,
-    )
+    if args.type in ("point", "parametric"):
+        pts = predictions[0].detach()
+        pts = (pts - pts.mean(0, keepdim=True)) / scale.to(pts.device)
+        pred_frames = utils_viz.render_points_360(
+            pts, image_size=args.image_size, num_views=args.num_views,
+            dist=3.0, device=args.device,
+        )
+    else:
+        if args.type == "mesh":
+            pred = (predictions.verts_list()[0].detach().cpu(), predictions.faces_list()[0].detach().cpu())
+        else:
+            pred = vox_to_mesh(predictions)
+        pred_frames = render_strip(
+            *(pred if pred is not None else (None, None)),
+            color=(0.85, 0.45, 0.35), scale=scale, args=args,
+        )
     gt_frames = render_strip(
         gt_verts, gt_faces, color=(0.45, 0.55, 0.85), scale=scale, args=args,
     )
 
     strip = [np.concatenate(f, axis=1) for f in zip(rgb_frames, pred_frames, gt_frames)]
-    imageio.mimsave(f'{args.vis_dir}/{step}_{args.type}.gif', strip, duration=1000 // 15, loop=0)
-    plt.imsave(f'{args.vis_dir}/{step}_{args.type}.png', strip[0])
-    print(f'wrote {args.vis_dir}/{step}_{args.type}.gif')
+    imageio.mimsave(f'{args.vis_dir}/{step}_{args.exp_name}.gif', strip, duration=1000 // 15, loop=0)
+    plt.imsave(f'{args.vis_dir}/{step}_{args.exp_name}.png', strip[0])
+    print(f'wrote {args.vis_dir}/{step}_{args.exp_name}.gif')
 
 
 def evaluate(predictions, mesh_gt, thresholds, args):
-    if args.type == "vox":
+    if args.type in ("vox", "implicit"):
         voxels_src = torch.sigmoid(predictions)
         H,W,D = voxels_src.shape[2:]
         vertices_src, faces_src = mcubes.marching_cubes(voxels_src.detach().cpu().squeeze().numpy(), isovalue=0.5)
+        if len(vertices_src) == 0 or len(faces_src) == 0:
+            # Nothing crosses 0.5: score it as a miss rather than crashing.
+            gt_points = sample_points_from_meshes(mesh_gt, args.n_points)
+            pred_points = torch.full_like(gt_points, 1e3)
+            return compute_sampling_metrics(pred_points, gt_points, thresholds)
         vertices_src = torch.tensor(vertices_src).float()
         faces_src = torch.tensor(faces_src.astype(int))
         mesh_src = pytorch3d.structures.Meshes([vertices_src], [faces_src])
@@ -176,13 +203,13 @@ def evaluate(predictions, mesh_gt, thresholds, args):
         pred_points = T_transform.transform_points(pred_points)
         # re-center the predicted points
         pred_points = pred_points - pred_points.mean(1, keepdim=True)
-    elif args.type == "point":
+    elif args.type in ("point", "parametric"):
         pred_points = predictions.cpu()
     elif args.type == "mesh":
         pred_points = sample_points_from_meshes(predictions, args.n_points).cpu()
 
     gt_points = sample_points_from_meshes(mesh_gt, args.n_points)
-    if args.type == "vox":
+    if args.type in ("vox", "implicit"):
         gt_points = gt_points - gt_points.mean(1, keepdim=True)
     metrics = compute_sampling_metrics(pred_points, gt_points, thresholds)
     return metrics
@@ -190,7 +217,19 @@ def evaluate(predictions, mesh_gt, thresholds, args):
 
 
 def evaluate_model(args):
-    r2n2_dataset = R2N2("test", dataset_location.SHAPENET_PATH, dataset_location.R2N2_PATH, dataset_location.SPLITS_PATH, return_voxels=True, return_feats=args.load_feat)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    args.exp_name = args.exp_name or args.type
+    full = dataset_location.use_full_dataset if args.dataset is None else args.dataset == '3c'
+    shapenet_path, r2n2_path, splits_path = dataset_location.get_paths(full)
+    r2n2_dataset = R2N2("test", shapenet_path, r2n2_path, splits_path, return_voxels=True, return_feats=args.load_feat)
+    if args.eval_class != 'all':
+        synset = dataset_location.CLASS_SYNSETS[args.eval_class]
+        if synset not in r2n2_dataset.synset_start_idxs:
+            raise ValueError(f'{args.eval_class} is not in {splits_path}')
+        start = r2n2_dataset.synset_start_idxs[synset]
+        r2n2_dataset = torch.utils.data.Subset(
+            r2n2_dataset, range(start, start + r2n2_dataset.synset_num_models[synset]))
 
     loader = torch.utils.data.DataLoader(
         r2n2_dataset,
@@ -214,9 +253,10 @@ def evaluate_model(args):
     avg_f1_score = []
     avg_p_score = []
     avg_r_score = []
+    f1_by_class = {}
 
     if args.load_checkpoint:
-        checkpoint = torch.load(f'checkpoint_{args.type}.pth')
+        checkpoint = torch.load(f'checkpoint_{args.exp_name}.pth')
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Succesfully loaded iter {start_iter}")
     
@@ -233,12 +273,13 @@ def evaluate_model(args):
 
         read_time = time.time() - read_start_time
 
-        predictions = model(images_gt, args)
+        with torch.no_grad():
+            predictions = model(images_gt, args)
 
         metrics = evaluate(predictions, mesh_gt, thresholds, args)
 
         if (step % args.vis_freq) == 0:
-            visualize_prediction(images_gt, predictions, mesh_gt, step, args)
+            visualize_prediction(feed_dict['images'], predictions, mesh_gt, step, args)
 
 
         total_time = time.time() - start_time
@@ -246,6 +287,8 @@ def evaluate_model(args):
 
         f1_05 = metrics['F1@0.050000']
         avg_f1_score_05.append(f1_05)
+        for synset, f1 in zip(feed_dict['synset_id'], f1_05.tolist()):
+            f1_by_class.setdefault(dataset_location.SYNSET_CLASSES.get(synset, synset), []).append(f1)
         avg_p_score.append(torch.tensor([metrics["Precision@%f" % t] for t in thresholds]))
         avg_r_score.append(torch.tensor([metrics["Recall@%f" % t] for t in thresholds]))
         avg_f1_score.append(torch.tensor([metrics["F1@%f" % t] for t in thresholds]))
@@ -256,6 +299,21 @@ def evaluate_model(args):
     avg_f1_score = torch.stack(avg_f1_score).mean(0)
 
     save_plot(thresholds, avg_f1_score,  args)
+
+    summary = {
+        'exp_name': args.exp_name,
+        'eval_class': args.eval_class,
+        'thresholds': thresholds,
+        'f1': avg_f1_score.tolist(),
+        'precision': torch.stack(avg_p_score).mean(0).tolist(),
+        'recall': torch.stack(avg_r_score).mean(0).tolist(),
+        'f1@0.05_by_class': {c: float(np.mean(v)) for c, v in f1_by_class.items()},
+        'n_by_class': {c: len(v) for c, v in f1_by_class.items()},
+    }
+    for c, v in summary['f1@0.05_by_class'].items():
+        print(f'{c:>8s}: F1@0.05 = {v:.3f}  (n={summary["n_by_class"][c]})')
+    with open(f'eval_{args.exp_name}_{args.eval_class}.json', 'w') as f:
+        json.dump(summary, f, indent=2)
     print('Done!')
 
 if __name__ == '__main__':

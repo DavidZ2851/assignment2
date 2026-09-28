@@ -6,6 +6,87 @@ import torch
 from pytorch3d.utils import ico_sphere
 import pytorch3d
 
+
+def make_grid(res=32):
+   
+    lin = torch.linspace(-1.0, 1.0, res)
+    zz, yy, xx = torch.meshgrid(lin, lin, lin, indexing="ij")
+    return torch.stack([xx, yy, zz], dim=-1)
+
+
+class ImplicitDecoder(nn.Module):
+
+    def __init__(self, feat_dim=512, hidden=256, n_freqs=6, res=32):
+        super().__init__()
+        self.res = res
+        self.register_buffer("freqs", (2.0 ** torch.arange(n_freqs)) * torch.pi, persistent=False)
+        self.register_buffer("grid", make_grid(res), persistent=False)
+        pe_dim = 3 + 3 * 2 * n_freqs
+
+        self.point_in = nn.Linear(pe_dim, hidden)
+        self.feat_in = nn.Linear(feat_dim, hidden)
+        self.block1 = nn.Sequential(
+            nn.ReLU(inplace=True), nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True), nn.Linear(hidden, hidden),
+        )
+        self.skip_point = nn.Linear(pe_dim, hidden)
+        self.skip_feat = nn.Linear(feat_dim, hidden)
+        self.block2 = nn.Sequential(
+            nn.ReLU(inplace=True), nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True), nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True), nn.Linear(hidden, 1),
+        )
+
+    def encode_points(self, xyz):
+        angles = xyz.unsqueeze(-1) * self.freqs  # b x N x 3 x F
+        pe = torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2)
+        return torch.cat([xyz, pe], dim=-1)
+
+    def query(self, feat, xyz):
+        
+        pe = self.encode_points(xyz)
+        h = self.point_in(pe) + self.feat_in(feat).unsqueeze(1)
+        h = self.block1(h)
+        h = h + self.skip_point(pe) + self.skip_feat(feat).unsqueeze(1)
+        return self.block2(h).squeeze(-1)
+
+    def forward(self, feat, xyz=None):
+
+        if xyz is not None:
+            return self.query(feat, xyz)
+        B, r = feat.shape[0], self.res
+        xyz = self.grid.reshape(1, -1, 3).expand(B, -1, -1)
+        return self.query(feat, xyz).reshape(B, 1, r, r, r)
+
+
+class ParametricDecoder(nn.Module):
+
+
+    def __init__(self, feat_dim=512, hidden=256, n_patches=4):
+        super().__init__()
+        self.n_patches = n_patches
+        self.uv_in = nn.ModuleList([nn.Linear(2, hidden) for _ in range(n_patches)])
+        self.feat_in = nn.ModuleList([nn.Linear(feat_dim, hidden) for _ in range(n_patches)])
+        self.mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.ReLU(inplace=True), nn.Linear(hidden, hidden),
+                nn.ReLU(inplace=True), nn.Linear(hidden, hidden),
+                nn.ReLU(inplace=True), nn.Linear(hidden, 3),
+            )
+            for _ in range(n_patches)
+        ])
+
+    def forward(self, feat, n_points=None, uv=None):
+        if uv is None:
+            M = n_points // self.n_patches
+            uv = torch.rand(feat.shape[0], self.n_patches, M, 2, device=feat.device)
+        points = []
+        for k in range(self.n_patches):
+            h = self.uv_in[k](uv[:, k]) + self.feat_in[k](feat).unsqueeze(1)
+            points.append(self.mlps[k](h))
+        return torch.cat(points, dim=1)
+
+
 class SingleViewto3D(nn.Module):
     def __init__(self, args):
         super(SingleViewto3D, self).__init__()
@@ -38,6 +119,15 @@ class SingleViewto3D(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Conv3d(8, 1, 3, stride=1, padding=1),
             )
+        elif args.type == "implicit":
+            # Input: b x 512 (+ b x N x 3 query points)
+            # Output: b x N logits, or b x 1 x 32 x 32 x 32 over the full grid
+            self.decoder = ImplicitDecoder(feat_dim=512)
+        elif args.type == "parametric":
+            # Input: b x 512 (+ uv samples in [0,1]^2 per patch)
+            # Output: b x args.n_points x 3
+            self.n_point = args.n_points
+            self.decoder = ParametricDecoder(feat_dim=512, n_patches=args.n_patches)
         elif args.type == "point":
             # Input: b x 512
             # Output: b x args.n_points x 3  
@@ -64,7 +154,7 @@ class SingleViewto3D(nn.Module):
                 nn.Linear(2048, self.n_vert * 3),
             )
 
-    def forward(self, images, args):
+    def forward(self, images, args, query_points=None):
         results = dict()
 
         total_loss = 0.0
@@ -82,6 +172,12 @@ class SingleViewto3D(nn.Module):
         if args.type == "vox":
             voxels_pred = self.decoder(encoded_feat)
             return voxels_pred
+
+        elif args.type == "implicit":
+            return self.decoder(encoded_feat, query_points)
+
+        elif args.type == "parametric":
+            return self.decoder(encoded_feat, n_points=self.n_point)
 
         elif args.type == "point":
             pointclouds_pred = self.decoder(encoded_feat).reshape(B, self.n_point, 3)
